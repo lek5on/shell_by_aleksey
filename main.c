@@ -11,355 +11,291 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fuse.h>
-#include <limits.h>
 
-#define MAX_BUFFER 1024
-#define HISTORY_FILE "command_log.txt"
+#define MY_SHELL_MAX_INPUT 1024
+#define HISTORY_FILE "history.txt"
 
-#define RESET_STYLE "\033[0m"
-#define ERROR_STYLE "\033[1;31m"
-#define PROMPT_STYLE "\033[1;35m"
+// Прототипы функций
+void handle_sighup(int sig);
+void check_boot_signature(const char *device);
+void mount_vfs_cron();
+void save_history(const char *command);
+void load_history();
+void handle_exit();
+void execute_command(char *args[]);
+void print_env_variable(char *arg);
 
-void reload_config(int signal_num);
-void check_boot_sector(const char *device_name);
-void init_virtual_fs();
-void log_command(const char *cmd);
-void show_history();
-void close_shell();
-void run_command(char *parameters[]);
-void show_env_variable(char *param);
-void handle_echo_command(char *parameters[]);
-void configure_signals();
-void execute_with_io_redirect(char *parameters[]);
-void create_memory_snapshot(pid_t process_id);
+// --- Реализация функций ---
 
-void reload_config(int signal_num)
-{
-    const char *message = "\nConfiguration has been reloaded\n";
-    write(STDERR_FILENO, message, strlen(message));
+// Обработчик сигнала SIGHUP
+void handle_sighup(int sig) {
+    printf("\nConfiguration reloaded\n");
 }
 
-void configure_signals()
-{
-    struct sigaction action = {0};
-    action.sa_handler = reload_config;
-    sigaction(SIGHUP, &action, NULL);
-    action.sa_handler = SIG_DFL;
-    sigaction(SIGINT, &action, NULL);
-}
+// Проверка загрузочного сектора
+void check_boot_signature(const char *device) {
+    unsigned char buffer[512]; // Буфер для первого сектора (512 байт — размер сектора)
+    char device_path[128];
+    snprintf(device_path, sizeof(device_path), "/dev/%s", device); // Формируем путь к устройству, например, "/dev/sda"
 
-void check_boot_sector(const char *device_name)
-{
-    unsigned char sector_data[512];
-    char path_to_device[128];
-    snprintf(path_to_device, sizeof(path_to_device), "/dev/%s", device_name);
-    int fd = open(path_to_device, O_RDONLY);
-    if (fd < 0)
-    {
-        perror("Failed to open device");
+    // Открываем устройство на чтение
+    int fd = open(device_path, O_RDONLY);
+    if (fd < 0) {
+        perror("Ошибка при открытии устройства");
         return;
     }
-    if (read(fd, sector_data, sizeof(sector_data)) != sizeof(sector_data))
-    {
-        perror("Failed to read sector");
+
+    // Считываем первый сектор
+    if (read(fd, buffer, sizeof(buffer)) != sizeof(buffer)) {
+        perror("Ошибка при чтении сектора");
         close(fd);
         return;
     }
     close(fd);
-    if (sector_data[510] == 0x55 && sector_data[511] == 0xAA)
-        printf("Disk %s is bootable\n", path_to_device);
-    else
-        printf("Disk %s is NOT bootable\n", path_to_device);
-}
 
-static int fs_get_attr(const char *path, struct stat *stat_buffer)
-{
-    memset(stat_buffer, 0, sizeof(struct stat));
-    if (strcmp(path, "/") == 0)
-    {
-        stat_buffer->st_mode = S_IFDIR | 0755;
-        stat_buffer->st_nlink = 2;
+    // Проверяем сигнатуру (последние два байта должны быть 0x55 и 0xAA)
+    if (buffer[510] == 0x55 && buffer[511] == 0xAA) {
+        printf("Диск %s является загрузочным (сигнатура 0xAA55 найдена).\n", device_path);
+    } else {
+        printf("Диск %s не является загрузочным (сигнатура 0xAA55 отсутствует).\n", device_path);
     }
-    else if (strcmp(path, "/tasks") == 0)
-    {
-        stat_buffer->st_mode = S_IFREG | 0444;
-        stat_buffer->st_nlink = 1;
-        stat_buffer->st_size = 1024;
-    }
-    else
-        return -ENOENT;
+}
+
+
+//О
+// VFS операции для cron
+static int vfs_getattr(const char* path, struct stat* stbuf) {
+    memset(stbuf, 0, sizeof(struct stat));
+    if (strcmp(path, "/") == 0) { stbuf->st_mode = S_IFDIR | 0755; stbuf->st_nlink = 2; }
+    else if (strcmp(path, "/tasks") == 0) { stbuf->st_mode = S_IFREG | 0444; stbuf->st_nlink = 1; stbuf->st_size = 1024; }
+    else return -ENOENT;
     return 0;
 }
 
-static int fs_read_dir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *info)
-{
-    if (strcmp(path, "/") != 0)
-        return -ENOENT;
-    filler(buffer, ".", NULL, 0);
-    filler(buffer, "..", NULL, 0);
-    filler(buffer, "tasks", NULL, 0);
+static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi) {
+    if (strcmp(path, "/") != 0) return -ENOENT;
+    filler(buf, ".", NULL, 0); filler(buf, "..", NULL, 0); filler(buf, "tasks", NULL, 0);
     return 0;
 }
 
-static int fs_open_file(const char *path, struct fuse_file_info *info)
-{
-    if (strcmp(path, "/tasks") != 0)
-        return -ENOENT;
+static int vfs_open(const char* path, struct fuse_file_info* fi) {
+    if (strcmp(path, "/tasks") != 0) return -ENOENT;
     return 0;
+    //А
 }
 
-static int fs_read_file(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *info)
-{
-    if (strcmp(path, "/tasks") != 0)
-        return -ENOENT;
-    FILE *cron_tasks = popen("crontab -l", "r");
-    if (!cron_tasks)
-        return -EIO;
-    char task_list[1024];
-    size_t read_len = fread(task_list, 1, sizeof(task_list), cron_tasks);
-    pclose(cron_tasks);
-    if (offset >= read_len)
-        return 0;
-    if (offset + size > read_len)
-        size = read_len - offset;
-    memcpy(buffer, task_list + offset, size);
+static int vfs_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+    if (strcmp(path, "/tasks") != 0) return -ENOENT;
+    FILE* cron = popen("crontab -l", "r");
+    if (!cron) return -EIO;
+    char tasks[1024];
+    size_t len = fread(tasks, 1, sizeof(tasks), cron);
+    pclose(cron);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buf, tasks + offset, size);
     return size;
 }
 
-static struct fuse_operations fs_operations = {
-    .getattr = fs_get_attr,
-    .readdir = fs_read_dir,
-    .open = fs_open_file,
-    .read = fs_read_file,
+static struct fuse_operations vfs_ops = {
+    .getattr = vfs_getattr,
+    .readdir = vfs_readdir,
+    .open = vfs_open,
+    .read = vfs_read,
 };
 
-void init_virtual_fs()
-{
-    if (mkdir("/tmp/custom_fs", 0755) == -1 && errno != EEXIST)
-    {
-        perror("Failed to create directory /tmp/custom_fs");
-        return;
+// Монтирование VFS для cron
+void mount_vfs_cron() {
+    if (mkdir("/tmp/vfs", 0755) == -1 && errno != EEXIST) {
+        perror("Ошибка создания /tmp/vfs"); return;
     }
-    pid_t process_id = fork();
-    if (process_id == 0)
-    {
-        if (setsid() < 0)
-        {
-            perror("Failed to create new session");
-            exit(EXIT_FAILURE);
-        }
-        close(STDIN_FILENO);
-        close(STDOUT_FILENO);
-        close(STDERR_FILENO);
-        open("/dev/null", O_RDONLY);
-        open("/dev/null", O_WRONLY);
-        open("/dev/null", O_WRONLY);
-        char *arguments[] = {"fs_mount", "/tmp/custom_fs", "-f", "-o", "nonempty", NULL};
-        if (fuse_main(5, arguments, &fs_operations, NULL) == -1)
-        {
-            perror("FUSE initialization error");
-            exit(EXIT_FAILURE);
-        }
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setsid() < 0) { perror("Ошибка setsid"); exit(EXIT_FAILURE); }
+        close(STDIN_FILENO); close(STDOUT_FILENO); close(STDERR_FILENO);
+        open("/dev/null", O_RDONLY); open("/dev/null", O_WRONLY); open("/dev/null", O_WRONLY);
+        char* argv[] = { "vfs_cron", "/tmp/vfs", "-f", "-o", "nonempty", NULL };
+        if (fuse_main(5, argv, &vfs_ops, NULL) == -1) { perror("Ошибка FUSE"); exit(EXIT_FAILURE); }
         exit(0);
     }
-    else if (process_id < 0)
-    {
-        perror("Fork error");
-    }
-    else
-    {
-        printf("Virtual filesystem mounted at /tmp/custom_fs\n");
+    else if (pid < 0) { perror("Ошибка fork"); }
+    else { printf("VFS смонтирован в /tmp/vfs. Список задач cron доступен.\n"); }
+}
+
+
+// --- Функции для работы с историей и командами ---
+
+void save_history(const char *command) {
+    int fd = open(HISTORY_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd != -1) {
+        write(fd, command, strlen(command));
+        write(fd, "\n", 1);
+        close(fd);
     }
 }
 
-void log_command(const char *cmd)
-{
-    int file_desc = open(HISTORY_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (file_desc != -1)
-    {
-        write(file_desc, cmd, strlen(cmd));
-        write(file_desc, "\n", 1);
-        close(file_desc);
-    }
-}
-
-void show_history()
-{
-    int file_desc = open(HISTORY_FILE, O_RDONLY);
-    if (file_desc != -1)
-    {
+void load_history() {
+    int fd = open(HISTORY_FILE, O_RDONLY);
+    if (fd != -1) {
         char buffer[4096];
         ssize_t bytes;
-        while ((bytes = read(file_desc, buffer, sizeof(buffer))) > 0)
+        while ((bytes = read(fd, buffer, sizeof(buffer))) > 0) {
             write(STDOUT_FILENO, buffer, bytes);
-        close(file_desc);
+        }
+        close(fd);
+    } else {
+        printf("История отсутствует.\n");
     }
-    else
-        printf("No command history available.\n");
 }
 
-void close_shell()
-{
-    printf("\nExiting shell.\n");
+void handle_exit() {
+    printf("\nВыход из шелла. До свидания!\n");
     exit(0);
 }
 
-void run_command(char *parameters[])
-{
-    if (fork() == 0)
-    {
-        execvp(parameters[0], parameters);
-        perror("Command execution failed");
+void execute_command(char *args[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (execvp(args[0], args) == -1) {
+            perror("Ошибка выполнения команды");
+        }
         exit(EXIT_FAILURE);
-    }
-    else
-    {
+    } else if (pid > 0) {
         int status;
-        wait(&status);
+        waitpid(pid, &status, 0);
+    } else {
+        perror("Ошибка при создании процесса");
     }
 }
 
-void show_env_variable(char *param)
-{
-    if (param[0] == '$')
-    {
-        char *value = getenv(param + 1);
-        printf("%s\n", value ? value : "Variable not found.");
-    }
-}
-
-void handle_echo_command(char *parameters[])
-{
-    for (int i = 1; parameters[i]; i++)
-    {
-        printf("%s%s", parameters[i], parameters[i + 1] ? " " : "\n");
-    }
-}
-
-void execute_with_io_redirect(char *parameters[])
-{
-    int i = 0, append = 0;
-    while (parameters[i])
-    {
-        if (!strcmp(parameters[i], ">"))
-        {
-            append = 0;
-            break;
+void print_env_variable(char *arg) {
+    if (arg[0] == '$') {
+        char *var_name = arg + 1;
+        char *value = getenv(var_name);
+        if (value) {
+            printf("%s\n", value);
+        } else {
+            printf("Переменная окружения %s не найдена.\n", var_name);
         }
-        if (!strcmp(parameters[i], ">>"))
-        {
-            append = 1;
-            break;
-        }
-        i++;
+    } else {
+        printf("Некорректный формат. Используйте \\e $VAR.\n");
     }
-    if (!parameters[i])
-    {
-        run_command(parameters);
+}
+
+void builtin_echo(char *args[]) {
+    for (int i = 1; args[i] != NULL; i++) { // Начинаем с args[1], так как args[0] — это "echo"
+        printf("%s", args[i]);
+        if (args[i + 1] != NULL) {
+            printf(" "); // Добавляем пробел между словами
+        }
+    }
+    printf("\n"); // Печатаем перевод строки в конце
+}
+
+void dump_memory(pid_t pid) {
+    char map_files_path[256], output_file[256], filepath[512];
+    snprintf(map_files_path, sizeof(map_files_path), "/proc/%d/map_files", pid);
+    snprintf(output_file, sizeof(output_file), "memory_dump_%d.txt", pid);
+
+    DIR *dir = opendir(map_files_path);
+    if (!dir) {
+        perror("Ошибка при открытии директории map_files");
         return;
     }
-    if (!parameters[i + 1])
-    {
-        fprintf(stderr, ERROR_STYLE "Error: file is missing.\n" RESET_STYLE);
+
+    FILE *out_file = fopen(output_file, "w");
+    if (!out_file) {
+        perror("Ошибка при создании файла дампа");
+        closedir(dir);
         return;
     }
-    parameters[i] = NULL;
-    char *filename = parameters[i + 1];
-    if (fork() == 0)
-    {
-        int fd = open(filename, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
-        if (fd < 0)
-        {
-            perror(ERROR_STYLE "File opening error" RESET_STYLE);
-            exit(EXIT_FAILURE);
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
         }
-        dup2(fd, STDOUT_FILENO);
+
+        snprintf(filepath, sizeof(filepath), "%s/%s", map_files_path, entry->d_name);
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) {
+            fprintf(out_file, "Ошибка доступа к %s: %s\n", filepath, strerror(errno));
+            continue;
+        }
+
+        char buffer[4096];
+        ssize_t bytes_read;
+        fprintf(out_file, "### Начало дампа: %s ###\n", filepath);
+        while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+            fwrite(buffer, 1, bytes_read, out_file);
+        }
+        fprintf(out_file, "\n### Конец дампа: %s ###\n\n", filepath);
         close(fd);
-        execvp(parameters[0], parameters);
-        perror(ERROR_STYLE "Command execution failed" RESET_STYLE);
-        exit(EXIT_FAILURE);
     }
-    else
-    {
-        int status;
-        wait(&status);
-    }
+
+    fclose(out_file);
+    closedir(dir);
+
+    printf("Дамп памяти процесса %d сохранён в файл: %s\n", pid, output_file);
 }
 
-void create_memory_snapshot(pid_t process_id)
-{
-    char maps_path[256], output_file[256];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", process_id);
-    snprintf(output_file, sizeof(output_file), "snapshot_%d.txt", process_id);
-    FILE *input = fopen(maps_path, "r"), *output = fopen(output_file, "w");
-    if (!input)
-    {
-        perror("Error opening process maps");
-        return;
-    }
-    if (!output)
-    {
-        perror("Snapshot creation failed");
-        fclose(input);
-        return;
-    }
-    char line[4096];
-    while (fgets(line, sizeof(line), input))
-        fputs(line, output);
-    fclose(input);
-    fclose(output);
-    printf("Memory snapshot of process %d saved to %s\n", process_id, output_file);
-}
 
-int main()
-{
-    char input[MAX_BUFFER], *parameters[128], cwd[PATH_MAX];
-    configure_signals();
+// --- Основной цикл программы ---
 
-    while (1)
-    {
-        if (getcwd(cwd, sizeof(cwd)))
-            printf(PROMPT_STYLE "%s >> " RESET_STYLE, cwd);
-        else
-        {
-            perror("Error retrieving current directory");
-            printf(PROMPT_STYLE "> " RESET_STYLE);
+int main() {
+    char input[MY_SHELL_MAX_INPUT];
+    char *args[128];
+
+    signal(SIGHUP, handle_sighup);
+    signal(SIGINT, SIG_IGN);
+
+    printf("Добро пожаловать в шелл! Введите 'exit' или '\\q' для выхода.\n");
+    printf("Введите 'history' для просмотра командной истории.\n");
+    printf("Введите '\\l <device>' для проверки загрузочного сектора (например, \\l sda).\n");
+    printf("Введите '\\cron' для монтирования VFS и просмотра задач cron.\n");
+    printf("Введите '\\mem <pid>' для получения дампа памяти процесса.\n");
+
+    while (1) {
+        printf("> ");
+        if (fgets(input, MY_SHELL_MAX_INPUT, stdin) == NULL) {
+            handle_exit();
         }
-        fflush(stdout);
-        if (!fgets(input, sizeof(input), stdin))
-        {
-            if (feof(stdin))
-                close_shell();
-            continue;
-        }
+
         input[strcspn(input, "\n")] = 0;
-        if (strlen(input))
-            log_command(input);
 
-        int i = 0;
+        if (strlen(input) > 0) {
+            save_history(input);
+        }
+
         char *token = strtok(input, " ");
-        while (token && i < 127)
-            parameters[i++] = token, token = strtok(NULL, " ");
-        parameters[i] = NULL;
+        int i = 0;
+        while (token != NULL) {
+            args[i++] = token;
+            token = strtok(NULL, " ");
+        }
+        args[i] = NULL;
 
-        if (!parameters[0])
+        if (args[0] == NULL) {
             continue;
-        if (!strcmp(parameters[0], "exit"))
-            close_shell();
-        else if (!strcmp(parameters[0], "history"))
-            show_history();
-        else if (!strcmp(parameters[0], "setenv") && parameters[1])
-            show_env_variable(parameters[1]);
-        else if (!strcmp(parameters[0], "bootcheck") && parameters[1])
-            check_boot_sector(parameters[1]);
-        else if (!strcmp(parameters[0], "vfs"))
-            init_virtual_fs();
-        else if (!strcmp(parameters[0], "snapshot") && parameters[1])
-            create_memory_snapshot(atoi(parameters[1]));
-        else if (!strcmp(parameters[0], "echo"))
-            handle_echo_command(parameters);
-        else
-            execute_with_io_redirect(parameters);
+        } else if (strcmp(args[0], "exit") == 0 || strcmp(args[0], "\\q") == 0) {
+            handle_exit();
+        } else if (strcmp(args[0], "history") == 0) {
+            load_history();
+        } else if (strcmp(args[0], "\\e") == 0 && args[1] != NULL) {
+            print_env_variable(args[1]);
+        } else if (strcmp(args[0], "\\l") == 0 && args[1] != NULL) {
+            check_boot_signature(args[1]);
+        } else if (strcmp(args[0], "\\cron") == 0) {
+            mount_vfs_cron();
+        } else if (strcmp(args[0], "\\mem") == 0 && args[1] != NULL) {
+            pid_t pid = atoi(args[1]);
+            dump_memory(pid);
+        } else if (strcmp(args[0], "echo") == 0) {
+            builtin_echo(args);
+        } else {
+            execute_command(args);
+        }
     }
+
     return 0;
 }
