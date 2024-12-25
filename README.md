@@ -14,3 +14,5 @@ docker pull lek5on/myshell:latest
 
 #Запустите контейнер:
 docker run --rm -it --privileged lek5on/myshell
+
+изменение 1
